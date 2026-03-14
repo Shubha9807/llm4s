@@ -3,45 +3,36 @@ package org.llm4s.runner
 import org.llm4s.shared._
 
 import java.io.{ BufferedWriter, PrintWriter }
-import java.nio.charset.StandardCharsets
+import java.nio.charset.{ Charset, StandardCharsets }
 import java.nio.file.{ Files, Path, Paths, StandardOpenOption }
 import java.time.Instant
 import java.time.format.DateTimeFormatter
 import java.util.regex.Pattern
 import scala.io.Source
 import scala.jdk.CollectionConverters._
-import scala.sys.process._
 import scala.util.{ Failure, Success, Try, Using }
+import java.util.concurrent.TimeUnit
 
 /**
  * Implementation of WorkspaceAgentInterface that operates on a local filesystem workspace.
  *
  * @param workspaceRoot The root directory of the workspace
  * @param isWindows     True if the host OS is Windows (used for shell command selection)
+ * @param sandboxConfig Optional sandbox config; if None, uses [[WorkspaceSandboxConfig.Permissive]]
  */
-class WorkspaceAgentInterfaceImpl(workspaceRoot: String, isWindows: Boolean) extends WorkspaceAgentInterface {
+class WorkspaceAgentInterfaceImpl(
+  workspaceRoot: String,
+  isWindows: Boolean,
+  sandboxConfig: Option[WorkspaceSandboxConfig] = None
+) extends WorkspaceAgentInterface {
 
   private val rootPath = Paths.get(workspaceRoot).toAbsolutePath.normalize()
 
-  // Default workspace limits
-  private val defaultLimits = WorkspaceLimits(
-    maxFileSize = 1048576, // 1MB
-    maxDirectoryEntries = 500,
-    maxSearchResults = 100,
-    maxOutputSize = 1048576 // 1MB
-  )
-
-  // Default exclusion patterns
-  private val defaultExclusions = List(
-    "**/node_modules/**",
-    "**/.git/**",
-    "**/dist/**",
-    "**/build/**",
-    "**/.venv/**",
-    "**/target/**",
-    "**/__pycache__/**",
-    "**/vendor/**"
-  )
+  private val config        = sandboxConfig.getOrElse(WorkspaceSandboxConfig.Permissive)
+  private val defaultLimits = config.limits
+  private val defaultExclusions =
+    if (config.excludePatterns.nonEmpty) config.excludePatterns
+    else WorkspaceSandboxConfig.DefaultExclusions
 
   /**
    * Resolves a relative path against the workspace root, ensuring it doesn't escape the workspace.
@@ -85,20 +76,23 @@ class WorkspaceAgentInterfaceImpl(workspaceRoot: String, isWindows: Boolean) ext
    * @param excludePatterns Patterns to exclude
    * @return true if the path should be excluded
    */
-  private def isExcluded(path: String, excludePatterns: List[String]): Boolean =
+  private def isExcluded(path: String, excludePatterns: List[String]): Boolean = {
     // Simple glob matching implementation
     // In a real implementation, use a proper glob library
+    val normalizedPath = path.replace("\\", "/")
     excludePatterns.exists { pattern =>
+      val normalizedPattern = pattern.replace("\\", "/")
       // Use a placeholder to avoid corrupting ** when replacing *
       val placeholder = "\u0000DOUBLESTAR\u0000"
-      val regex = pattern
+      val regex = normalizedPattern
         .replace("**", placeholder) // protect ** first
         .replace(".", "\\.")        // escape dots
         .replace("*", "[^/]+")      // single * matches path segment chars
         .replace(placeholder, ".*") // restore ** as .* to match any path
 
-      path.matches(regex)
+      normalizedPath.matches(regex) || (normalizedPath + "/").matches(regex)
     }
+  }
 
   /**
    * List files and directories in a specified path, optionally recursively.
@@ -511,28 +505,40 @@ class WorkspaceAgentInterfaceImpl(workspaceRoot: String, isWindows: Boolean) ext
     // Search in files
     var matches      = List.empty[SearchMatch]
     var totalMatches = 0
+    var done         = false // used to break out once we've observed one match past the cap
 
-    for (file <- filesToSearch if matches.size < defaultLimits.maxSearchResults) {
+    // stop scanning as soon as we've counted one result beyond the configured
+    // max; that allows us to report `isTruncated` correctly while avoiding a
+    // full workspace sweep. the `totalMatches` value is therefore only guaranteed
+    // to be accurate up to maxSearchResults+1.
+    for (file <- filesToSearch if !done) {
       val relativePath = rootPath.relativize(file).toString
 
       Try(Files.readAllLines(file, StandardCharsets.UTF_8).asScala.toList).toOption.foreach { lines =>
-        for ((line, lineIndex) <- lines.zipWithIndex if matches.size < defaultLimits.maxSearchResults) {
+        for ((line, lineIndex) <- lines.zipWithIndex if !done) {
           val matcher = pattern.matcher(line)
 
           if (matcher.find()) {
             totalMatches += 1
 
-            val lineNumber    = lineIndex + 1
-            val beforeContext = lines.slice(math.max(0, lineIndex - context), lineIndex)
-            val afterContext  = lines.slice(lineIndex + 1, math.min(lines.size, lineIndex + context + 1))
+            if (matches.size < defaultLimits.maxSearchResults) {
+              val lineNumber    = lineIndex + 1
+              val beforeContext = lines.slice(math.max(0, lineIndex - context), lineIndex)
+              val afterContext  = lines.slice(lineIndex + 1, math.min(lines.size, lineIndex + context + 1))
 
-            matches = matches :+ SearchMatch(
-              path = relativePath,
-              line = lineNumber,
-              matchText = line,
-              contextBefore = beforeContext,
-              contextAfter = afterContext
-            )
+              matches = matches :+ SearchMatch(
+                path = relativePath,
+                line = lineNumber,
+                matchText = line,
+                contextBefore = beforeContext,
+                contextAfter = afterContext
+              )
+            }
+
+            // once we've seen one hit past the cap we can stop scanning entirely
+            if (totalMatches > defaultLimits.maxSearchResults) {
+              done = true
+            }
           }
         }
       }
@@ -541,13 +547,14 @@ class WorkspaceAgentInterfaceImpl(workspaceRoot: String, isWindows: Boolean) ext
     SearchFilesResponse(
       commandId = "local",
       matches = matches,
-      isTruncated = totalMatches > defaultLimits.maxSearchResults,
+      isTruncated = totalMatches > matches.size,
       totalMatches = totalMatches
     )
   }
 
   /**
    * Execute a shell command in the workspace.
+   * When sandbox config has shellAllowed=false, throws WorkspaceAgentException.
    */
   override def executeCommand(
     command: String,
@@ -555,6 +562,14 @@ class WorkspaceAgentInterfaceImpl(workspaceRoot: String, isWindows: Boolean) ext
     timeoutSeconds: Option[Int] = None,
     environment: Option[Map[String, String]] = None
   ): ExecuteCommandResponse = {
+    if (!config.shellAllowed) {
+      throw new WorkspaceAgentException(
+        "Shell execution is disabled by sandbox config (shellAllowed=false)",
+        "SHELL_DISABLED",
+        None
+      )
+    }
+
     val workDir = workingDirectory
       .map(dir => resolvePath(dir).toFile)
       .getOrElse(rootPath.toFile)
@@ -567,51 +582,79 @@ class WorkspaceAgentInterfaceImpl(workspaceRoot: String, isWindows: Boolean) ext
       )
     }
 
-    val timeoutMs = (timeoutSeconds.getOrElse(30 /* Default 30 seconds */ ) * 1000).toLong
+    val timeoutMs = (timeoutSeconds.getOrElse(config.defaultCommandTimeoutSeconds) * 1000).toLong
     val env       = environment.getOrElse(Map.empty)
 
-    val cmd = if (isWindows) {
-      Seq("cmd.exe", "/c", command)
+    val builder = if (isWindows) {
+      new java.lang.ProcessBuilder("cmd.exe", "/c", command)
     } else {
-      Seq("sh", "-c", command)
+      new java.lang.ProcessBuilder("sh", "-c", command)
     }
-    val processBuilder = Process(
-      command = cmd,
-      cwd = workDir,
-      extraEnv = env.toSeq: _*
-    )
+    builder.directory(workDir)
+    env.foreach { case (k, v) => builder.environment().put(k, v) }
 
     val stdout    = new StringBuilder
     val stderr    = new StringBuilder
     val startTime = System.currentTimeMillis()
 
     val exitCode = Try {
-      val process = processBuilder.run(
-        ProcessLogger(
-          line =>
+      val process = builder.start()
+
+      // Read stdout and stderr in background threads to prevent blocking
+      val stdoutThread = new Thread(() => {
+        val reader = new java.io.BufferedReader(
+          new java.io.InputStreamReader(process.getInputStream, Charset.defaultCharset())
+        )
+        try {
+          var line = reader.readLine()
+          while (line != null) {
             if (stdout.length < defaultLimits.maxOutputSize) {
               stdout.append(line).append("\n")
-            },
-          line =>
+            }
+            line = reader.readLine()
+          }
+        } finally reader.close()
+      })
+
+      val stderrThread = new Thread(() => {
+        val reader = new java.io.BufferedReader(
+          new java.io.InputStreamReader(process.getErrorStream, Charset.defaultCharset())
+        )
+        try {
+          var line = reader.readLine()
+          while (line != null) {
             if (stderr.length < defaultLimits.maxOutputSize) {
               stderr.append(line).append("\n")
             }
-        )
-      )
+            line = reader.readLine()
+          }
+        } finally reader.close()
+      })
 
-      while (process.isAlive() && System.currentTimeMillis() - startTime < timeoutMs)
-        Thread.sleep(100)
+      stdoutThread.setDaemon(true)
+      stderrThread.setDaemon(true)
+      stdoutThread.start()
+      stderrThread.start()
 
-      val completed = !process.isAlive()
+      val completed = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
 
       if (!completed) {
         process.destroy()
+        // Wait up to 2 seconds for graceful termination before escalating
+        if (!process.waitFor(2, TimeUnit.SECONDS)) {
+          process.destroyForcibly()
+          process.waitFor(3, TimeUnit.SECONDS)
+        }
         throw new WorkspaceAgentException(
           s"Command execution timed out after ${timeoutMs}ms",
           "TIMEOUT",
           None
         )
       }
+
+      // Wait for output threads to finish capturing
+      stdoutThread.join(2000)
+      stderrThread.join(2000)
 
       process.exitValue()
     }.recover {

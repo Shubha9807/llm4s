@@ -6,6 +6,7 @@ import java.util.concurrent.{ CompletableFuture, ConcurrentHashMap, TimeUnit }
 import java.util.concurrent.locks.ReentrantLock
 import upickle.default._
 import org.slf4j.LoggerFactory
+import org.llm4s.http.Llm4sHttpClient
 import scala.concurrent.duration._
 
 // Transport type definitions
@@ -82,8 +83,12 @@ case class MCPSession(
 )
 
 // Streamable HTTP transport implementation (2025-06-18 spec)
-class StreamableHTTPTransportImpl(url: String, override val name: String, timeout: Duration = 30.seconds)
-    extends MCPTransportImpl {
+class StreamableHTTPTransportImpl(
+  url: String,
+  override val name: String,
+  timeout: Duration = 30.seconds,
+  httpClient: Llm4sHttpClient = Llm4sHttpClient.create()
+) extends MCPTransportImpl {
   private val logger                       = LoggerFactory.getLogger(getClass)
   private val requestId                    = new AtomicLong(0)
   private var mcpSessionId: Option[String] = None
@@ -100,13 +105,14 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
       // Build headers according to 2025-06-18 spec
       val headers = buildHeaders(request)
 
+      logger.debug(s"StreamableHTTPTransport($name) using URL: '$url'")
+
       // POST to MCP endpoint (single endpoint, no /sse suffix)
-      val response = requests.post(
-        url,
-        data = requestJson,
+      val response = httpClient.post(
+        url = url,
         headers = headers,
-        readTimeout = timeout.toMillis.toInt,
-        connectTimeout = timeout.toMillis.toInt
+        body = requestJson,
+        timeout = timeout.toMillis.toInt
       )
 
       logger.debug(s"StreamableHTTPTransport($name) received HTTP response: status=${response.statusCode}")
@@ -114,17 +120,13 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
       // Handle session management during initialization according to MCP spec : the server may or may not include a session id
       if (request.method == "initialize" && response.statusCode >= 200 && response.statusCode < 300) {
         // Look for mcp-session-id header in response (lowercase per spec)
-        val sessionIdOpt = response.headers.get("mcp-session-id")
+        val sessionIdOpt = response.headers.get("mcp-session-id").flatMap(_.headOption)
 
-        sessionIdOpt.foreach { sessionIdValue =>
-          // Handle both String and Seq[String] types from requests library
-          val sessionId = sessionIdValue match {
-            case seq: Seq[_] if seq.nonEmpty => seq.head.toString.trim
-            case other                       => other.toString.trim
-          }
-          if (sessionId.nonEmpty && !sessionId.startsWith("List(")) {
-            mcpSessionId = Some(sessionId)
-            logger.info(s"StreamableHTTPTransport($name) established MCP session: $sessionId")
+        sessionIdOpt.foreach { sessionId =>
+          val trimmed = sessionId.trim
+          if (trimmed.nonEmpty) {
+            mcpSessionId = Some(trimmed)
+            logger.info(s"StreamableHTTPTransport($name) established MCP session: $trimmed")
           }
         }
 
@@ -147,13 +149,14 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
 
       // Handle other HTTP errors
       if (response.statusCode >= 400) {
-        val errorBody = Try(response.text()).getOrElse("Unknown error")
-        throw new RuntimeException(s"HTTP error ${response.statusCode}: $errorBody")
+        throw new RuntimeException(
+          s"HTTP error ${response.statusCode}: ${org.llm4s.util.Redaction.truncateForLog(response.body)}"
+        )
       }
 
       // Determine response type based on content-type header
-      val responseBody = response.text()
-      val contentType  = response.headers.get("content-type").map(_.toString.toLowerCase)
+      val responseBody = response.body
+      val contentType  = response.headers.get("content-type").flatMap(_.headOption).map(_.toLowerCase)
       val isSSE        = contentType.exists(_.contains("text/event-stream"))
 
       val jsonResponse = if (isSSE) {
@@ -301,12 +304,11 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
       val headers = buildNotificationHeaders()
 
       // POST to MCP endpoint
-      val response = requests.post(
-        url,
-        data = notificationJson,
+      val response = httpClient.post(
+        url = url,
         headers = headers,
-        readTimeout = timeout.toMillis.toInt,
-        connectTimeout = timeout.toMillis.toInt
+        body = notificationJson,
+        timeout = timeout.toMillis.toInt
       )
 
       logger.debug(
@@ -315,8 +317,9 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
 
       // Handle HTTP errors (notifications still use HTTP)
       if (response.statusCode >= 400) {
-        val errorBody = Try(response.text()).getOrElse("Unknown error")
-        throw new RuntimeException(s"HTTP error ${response.statusCode}: $errorBody")
+        throw new RuntimeException(
+          s"HTTP error ${response.statusCode}: ${org.llm4s.util.Redaction.truncateForLog(response.body)}"
+        )
       }
 
       // For notifications, we don't parse the response body since no response is expected
@@ -354,11 +357,10 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
     // Send DELETE request to explicitly terminate session if we have one
     mcpSessionId.foreach { sessionId =>
       Try {
-        requests.delete(
-          url,
+        httpClient.delete(
+          url = url,
           headers = Map("mcp-session-id" -> sessionId), // lowercase per spec
-          readTimeout = timeout.toMillis.toInt,
-          connectTimeout = timeout.toMillis.toInt
+          timeout = timeout.toMillis.toInt
         )
         logger.debug(s"StreamableHTTPTransport($name) sent session termination request")
       }.recover { case e =>
@@ -377,8 +379,12 @@ class StreamableHTTPTransportImpl(url: String, override val name: String, timeou
 }
 
 // SSE transport implementation using HTTP (2024-11-05 spec)
-class SSETransportImpl(url: String, override val name: String, timeout: Duration = 30.seconds)
-    extends MCPTransportImpl {
+class SSETransportImpl(
+  url: String,
+  override val name: String,
+  timeout: Duration = 30.seconds,
+  httpClient: Llm4sHttpClient = Llm4sHttpClient.create()
+) extends MCPTransportImpl {
   private val logger                       = LoggerFactory.getLogger(getClass)
   private val requestId                    = new AtomicLong(0)
   private var mcpSessionId: Option[String] = None
@@ -397,12 +403,11 @@ class SSETransportImpl(url: String, override val name: String, timeout: Duration
       // Build headers according to MCP 2024-11-05 specification
       val headers = buildHeaders(request)
 
-      val response = requests.post(
-        url, // Remove /sse suffix - MCP servers use base URL
-        data = requestJson,
+      val response = httpClient.post(
+        url = url, // Remove /sse suffix - MCP servers use base URL
         headers = headers,
-        readTimeout = timeout.toMillis.toInt,
-        connectTimeout = timeout.toMillis.toInt
+        body = requestJson,
+        timeout = timeout.toMillis.toInt
       )
 
       logger.debug(s"SSETransport($name) received HTTP response: status=${response.statusCode}")
@@ -410,17 +415,13 @@ class SSETransportImpl(url: String, override val name: String, timeout: Duration
       // Handle session management during initialization
       if (request.method == "initialize" && response.statusCode >= 200 && response.statusCode < 300) {
         // Look for mcp-session-id header in response (lowercase per spec)
-        val sessionIdOpt = response.headers.get("mcp-session-id")
+        val sessionIdOpt = response.headers.get("mcp-session-id").flatMap(_.headOption)
 
-        sessionIdOpt.foreach { sessionIdValue =>
-          // Handle both String and Seq[String] types from requests library
-          val sessionId = sessionIdValue match {
-            case seq: Seq[_] if seq.nonEmpty => seq.head.toString.trim
-            case other                       => other.toString.trim
-          }
-          if (sessionId.nonEmpty && !sessionId.startsWith("List(")) {
-            mcpSessionId = Some(sessionId)
-            logger.info(s"SSETransport($name) established MCP session: $sessionId")
+        sessionIdOpt.foreach { sessionId =>
+          val trimmed = sessionId.trim
+          if (trimmed.nonEmpty) {
+            mcpSessionId = Some(trimmed)
+            logger.info(s"SSETransport($name) established MCP session: $trimmed")
           }
         }
 
@@ -438,13 +439,14 @@ class SSETransportImpl(url: String, override val name: String, timeout: Duration
 
       // Handle other HTTP errors
       if (response.statusCode >= 400) {
-        val errorBody = Try(response.text()).getOrElse("Unknown error")
-        throw new RuntimeException(s"HTTP error ${response.statusCode}: $errorBody")
+        throw new RuntimeException(
+          s"HTTP error ${response.statusCode}: ${org.llm4s.util.Redaction.truncateForLog(response.body)}"
+        )
       }
 
       // Determine response type based on content-type header
-      val responseBody = response.text()
-      val contentType  = response.headers.get("content-type").map(_.toString.toLowerCase)
+      val responseBody = response.body
+      val contentType  = response.headers.get("content-type").flatMap(_.headOption).map(_.toLowerCase)
       val isSSE        = contentType.exists(_.contains("text/event-stream"))
 
       val jsonResponse = if (isSSE) {
@@ -532,20 +534,20 @@ class SSETransportImpl(url: String, override val name: String, timeout: Duration
       // Build headers for notification
       val headers = buildNotificationHeaders()
 
-      val response = requests.post(
-        url,
-        data = notificationJson,
+      val response = httpClient.post(
+        url = url,
         headers = headers,
-        readTimeout = timeout.toMillis.toInt,
-        connectTimeout = timeout.toMillis.toInt
+        body = notificationJson,
+        timeout = timeout.toMillis.toInt
       )
 
       logger.debug(s"SSETransport($name) received HTTP response for notification: status=${response.statusCode}")
 
       // Handle HTTP errors
       if (response.statusCode >= 400) {
-        val errorBody = Try(response.text()).getOrElse("Unknown error")
-        throw new RuntimeException(s"HTTP error ${response.statusCode}: $errorBody")
+        throw new RuntimeException(
+          s"HTTP error ${response.statusCode}: ${org.llm4s.util.Redaction.truncateForLog(response.body)}"
+        )
       }
 
       // For notifications, we don't parse the response body since no response is expected
@@ -584,11 +586,10 @@ class SSETransportImpl(url: String, override val name: String, timeout: Duration
     // Send DELETE request to explicitly terminate session if we have one
     mcpSessionId.foreach { sessionId =>
       Try {
-        requests.delete(
-          url,
+        httpClient.delete(
+          url = url,
           headers = Map("mcp-session-id" -> sessionId), // lowercase per spec
-          readTimeout = timeout.toMillis.toInt,
-          connectTimeout = timeout.toMillis.toInt
+          timeout = timeout.toMillis.toInt
         )
         logger.debug(s"SSETransport($name) sent session termination request")
       }.recover { case e =>
@@ -615,7 +616,15 @@ class SSETransportImpl(url: String, override val name: String, timeout: Duration
 // - Lock management (ReentrantLock release in finally)
 // - Thread interrupt handling (catching InterruptedException)
 // - Low-level concurrent I/O error handling
-class StdioTransportImpl(command: Seq[String], override val name: String) extends MCPTransportImpl {
+class StdioTransportImpl(
+  command: Seq[String],
+  override val name: String,
+  startupTimeoutMs: Int = 10000
+) extends MCPTransportImpl {
+
+  /** Binary-compatible auxiliary constructor matching the pre-timeout 2-param signature. */
+  def this(command: Seq[String], name: String) = this(command, name, 10000)
+
   private val logger                                       = LoggerFactory.getLogger(getClass)
   private var process: Option[Process]                     = None
   private val requestId                                    = new AtomicLong(0)
@@ -633,8 +642,8 @@ class StdioTransportImpl(command: Seq[String], override val name: String) extend
 
   // Timeout for server responses (30 seconds)
   private val RESPONSE_TIMEOUT_MS = 30000L
-  // Timeout for server startup (10 seconds)
-  private val STARTUP_TIMEOUT_MS = 10000
+  // Timeout for server startup
+  private val STARTUP_TIMEOUT_MS = startupTimeoutMs
 
   logger.info(s"StdioTransport($name) initialized with command: ${command.mkString(" ")}")
 
@@ -806,7 +815,7 @@ class StdioTransportImpl(command: Seq[String], override val name: String) extend
         return Right(())
       }
 
-      Thread.sleep(100) // Small delay before checking again
+      Thread.sleep(10) // Small delay before checking again
     }
 
     // Server might be ready even without immediate output

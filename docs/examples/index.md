@@ -224,6 +224,23 @@ sbt "samples/runMain org.llm4s.samples.basic.AgentLLMCallingExample"
 - Agent state tracking
 
 ---
+### ProviderFallbackExample
+
+**File:** [`ProviderFallbackExample.scala`](https://github.com/llm4s/llm4s/blob/main/modules/samples/src/main/scala/org/llm4s/samples/basic/ProviderFallbackExample.scala)
+
+LLM calls with automatic provider fallback for reliability.
+
+```bash
+sbt "samples/runMain org.llm4s.samples.basic.ProviderFallbackExample"
+```
+**What it demonstrates:**
+- Multiple provider configurations
+- Automatic fallback on failure
+- Enhanced reliability
+
+---
+
+
 
 ## Agent Examples
 
@@ -425,24 +442,6 @@ val weatherTool = ToolFunction(
 ```
 
 [View source →](https://github.com/llm4s/llm4s/blob/main/modules/samples/src/main/scala/org/llm4s/samples/toolapi/WeatherToolExample.scala)
-
----
-
-### LLMWeatherExample {#llm-weather}
-
-**File:** [`LLMWeatherExample.scala`](https://github.com/llm4s/llm4s/blob/main/modules/samples/src/main/scala/org/llm4s/samples/toolapi/LLMWeatherExample.scala)
-
-Using tools with LLM calls - agent automatically calls tools.
-
-```bash
-sbt "samples/runMain org.llm4s.samples.toolapi.LLMWeatherExample"
-```
-
-**What it demonstrates:**
-- LLM tool calling
-- Automatic tool selection
-- Tool result integration
-- Natural language to tool execution
 
 ---
 
@@ -1146,7 +1145,7 @@ All examples are in the [samples directory](https://github.com/llm4s/llm4s/tree/
 
 ## Next Steps
 
-- **[User Guide](/guide/basic-usage)** - Learn concepts in depth
+- **[User Guide](../guide/basic-usage)** - Learn concepts in depth
 - **[API Reference](/api/llm-client)** - Detailed API documentation
 - **[Discord Community](https://discord.gg/4uvTPn6qww)** - Get help and share projects
 
